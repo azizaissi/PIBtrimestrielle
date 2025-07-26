@@ -20,21 +20,27 @@ import matplotlib.pyplot as plt
 import joblib
 import hashlib
 import csv
+import time
 from io import BytesIO
+import logging
+
+# Configuration du journal de logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration initiale
 st.title("🔍 Prédiction du PIB trimestriel pour 2024")
 cet = pytz.timezone('CET')
-current_date_time = cet.localize(datetime(2025, 7, 25, 19, 29))  # Updated to 07:29 PM CET, July 25, 2025
+current_date_time = cet.localize(datetime(2025, 7, 26, 21, 26))
 st.write(f"**Date et heure actuelles :** {current_date_time.strftime('%d/%m/%Y %H:%M %Z')}")
 
 random.seed(42)
 np.random.seed(42)
 
-# Initialize error log
+# Initialisation du journal des erreurs
 error_log = []
 
-# Normalize string function
+# Fonction de normalisation des chaînes
 def normalize_name(name):
     if pd.isna(name) or not isinstance(name, str):
         error_log.append(f"Valeur non textuelle ou NaN : {name}. Remplacement par 'inconnu'.")
@@ -53,17 +59,18 @@ def normalize_name(name):
     name = re.sub(r'\s+', ' ', name).lower()
     return name
 
-# Convert Roman numeral quarters to standard quarter format
+# Conversion des trimestres en chiffres romains
 def convert_roman_to_quarter(index_str):
     roman_to_arabic = {'i': '1', 'ii': '2', 'iii': '3', 'iv': '4'}
     match = re.match(r'^(I|II|III|IV)\s*trimestre\s*(\d{4})$', index_str, re.IGNORECASE)
     if not match:
+        error_log.append(f"Format de trimestre invalide : {index_str}")
         raise ValueError(f"Format de trimestre invalide : {index_str}")
     roman_quarter, year = match.groups()
     quarter = roman_to_arabic[roman_quarter.lower()]
     return f"{year}Q{quarter}"
 
-# Compute file hash for cache validation
+# Calcul du hash du fichier pour validation du cache
 def compute_file_hash(file_path):
     hasher = hashlib.sha256()
     with open(file_path, 'rb') as f:
@@ -71,41 +78,25 @@ def compute_file_hash(file_path):
             hasher.update(chunk)
     return hasher.hexdigest()
 
-# Load and preprocess data
-@st.cache_data
+# Chargement et prétraitement des données
+@st.cache_data(show_spinner=False, persist=True)
 def load_and_preprocess(uploaded_file=None, _cache_key="default"):
+    start_time = time.time()
     try:
         if uploaded_file:
-            # Check if file is empty
             uploaded_file.seek(0)
             raw_content = uploaded_file.read()
             if not raw_content.strip():
                 error_log.append("Le fichier uploadé est vide.")
-                st.error("Le fichier uploadé est vide. Veuillez vérifier le fichier.")
+                st.error("Erreur : Le fichier uploadé est vide. Veuillez vérifier le fichier.")
                 raise ValueError("Fichier vide.")
             error_log.append(f"Contenu brut du fichier uploadé (premiers 200 octets) : {raw_content[:200].decode('utf-8', errors='replace')}...")
             
-            # Try detecting separator with csv.Sniffer
-            uploaded_file.seek(0)
-            try:
-                sample = uploaded_file.read(1024).decode('utf-8', errors='ignore')
-                uploaded_file.seek(0)
-                sniffer = csv.Sniffer()
-                dialect = sniffer.sniff(sample)
-                detected_sep = dialect.delimiter
-                error_log.append(f"Séparateur détecté par csv.Sniffer : '{detected_sep}'")
-            except Exception as e:
-                detected_sep = None
-                error_log.append(f"Échec de la détection du séparateur avec csv.Sniffer : {str(e)}")
-
-            # Define encodings and separators to try
             encodings = ['utf-8', 'latin-1', 'windows-1252', 'iso-8859-1']
-            separators = [detected_sep] if detected_sep else [';', ',', '\t', '|', ':']
+            separators = [';', ',', '\t', '|', ':']
             df = None
             for encoding in encodings:
                 for sep in separators:
-                    if sep is None:
-                        continue
                     try:
                         uploaded_file.seek(0)
                         df = pd.read_csv(
@@ -115,21 +106,21 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
                             encoding=encoding,
                             sep=sep,
                             skipinitialspace=True,
-                            engine='python'
+                            engine='c',
+                            dtype_backend='numpy_nullable'
                         )
                         if not df.empty and len(df.columns) > 1:
                             first_col = df.columns[0].lower().strip()
                             if first_col.startswith('sect') or first_col in ['\ufeffsecteur', 'sector']:
                                 error_log.append(f"Fichier chargé avec encodage '{encoding}' et séparateur '{sep}'.")
                                 break
-                    except (UnicodeDecodeError, pd.errors.ParserError, ValueError) as e:
+                    except Exception as e:
                         error_log.append(f"Échec de lecture avec encodage '{encoding}' et séparateur '{sep}': {str(e)}")
                 if df is not None:
                     break
             else:
-                # Manual input for encoding and separator
                 st.error("Échec de la lecture automatique du CSV. Veuillez spécifier l'encodage et le séparateur.")
-                encoding = st.selectbox("Choisir l'encodage", ['utf-8', 'latin-1', 'windows-1252', 'iso-8859-1'])
+                encoding = st.selectbox("Choisir l'encodage", encodings)
                 sep = st.text_input("Entrer le séparateur (e.g., ';', ',', '\\t')", value=';')
                 try:
                     uploaded_file.seek(0)
@@ -140,32 +131,38 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
                         encoding=encoding,
                         sep=sep,
                         skipinitialspace=True,
-                        engine='python'
+                        engine='c'
                     )
                     error_log.append(f"Fichier chargé avec encodage manuel '{encoding}' et séparateur '{sep}'.")
                 except Exception as e:
                     error_log.append(f"Échec de lecture avec encodage manuel '{encoding}' et séparateur '{sep}': {str(e)}")
-                    st.error(f"Impossible de lire le fichier CSV avec les paramètres fournis : {str(e)}")
+                    st.error(f"Erreur : Impossible de lire le fichier CSV avec les paramètres fournis : {str(e)}")
                     raise ValueError("Format CSV invalide ou paramètres incorrects.")
 
             if df is None:
                 error_log.append("Aucun DataFrame valide n'a pu être chargé.")
-                st.error("Impossible de lire le fichier CSV. Vérifiez le contenu du fichier.")
+                st.error("Erreur : Impossible de lire le fichier CSV. Vérifiez le contenu du fichier.")
                 raise ValueError("Aucun DataFrame valide chargé.")
         else:
-            # Fallback to default file
             default_file = "PIB_Trimestrielle.csv"
             if not os.path.exists(default_file):
                 error_log.append(f"Fichier '{default_file}' introuvable.")
-                st.error(f"Fichier '{default_file}' introuvable. Vérifiez le chemin du fichier.")
+                st.error(f"Erreur : Fichier '{default_file}' introuvable. Vérifiez le chemin du fichier.")
                 raise FileNotFoundError(f"Fichier '{default_file}' introuvable.")
-            df = pd.read_csv(default_file, thousands=' ', decimal=',', encoding='latin-1', sep=';')
+            df = pd.read_csv(
+                default_file,
+                thousands=' ',
+                decimal=',',
+                encoding='latin-1',
+                sep=';',
+                engine='c',
+                dtype_backend='numpy_nullable'
+            )
             error_log.append(f"Fichier chargé comme CSV avec encodage 'latin-1' et séparateur ';'.")
 
-        # Validate and rename columns
         if df.empty or len(df.columns) == 0:
             error_log.append("Le fichier CSV ne contient aucune colonne valide.")
-            st.error("Le fichier CSV ne contient aucune colonne valide.")
+            st.error("Erreur : Le fichier CSV ne contient aucune colonne valide.")
             raise ValueError("Aucune colonne dans le fichier CSV.")
         
         first_col = df.columns[0].lower().strip()
@@ -174,11 +171,10 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
             error_log.append(f"Première colonne renommée en 'Secteur' (précédemment : '{first_col}')")
         
         if 'Secteur' not in df.columns:
-            st.error(f"La colonne 'Secteur' n'est pas présente. Colonnes actuelles : {list(df.columns)}")
+            st.error(f"Erreur : La colonne 'Secteur' n'est pas présente. Colonnes actuelles : {list(df.columns)}")
             error_log.append(f"Colonne 'Secteur' absente. Colonnes trouvées : {df.columns.tolist()}")
             raise KeyError("Colonne 'Secteur' manquante après renommage.")
 
-        # Normalize data
         df['Secteur'] = df['Secteur'].apply(normalize_name)
         df.columns = ['Secteur' if col == 'Secteur' else normalize_name(col) for col in df.columns]
         for col in df.columns[1:]:
@@ -219,6 +215,11 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
             "crise sociale"
         ]
 
+        macro_keywords = [normalize_name(m) for m in macro_keywords]
+        sectors = [normalize_name(s) for s in sectors]
+        macro_rates = [normalize_name(m) for m in macro_rates]
+        events = [normalize_name(e) for e in events]
+
         actual_sectors = df['Secteur'].tolist()
         error_log.append(f"Secteurs dans le CSV : {actual_sectors}")
 
@@ -232,7 +233,7 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
                     df_pib['Secteur'] = 'produit interieur brut'
                     break
             if df_pib.empty:
-                st.error("Aucune donnée PIB trouvée même après recherche de variantes. Colonnes disponibles : {}".format(df['Secteur'].tolist()))
+                st.error("Erreur : Aucune donnée PIB trouvée même après recherche de variantes. Colonnes disponibles : {}".format(df['Secteur'].tolist()))
                 error_log.append("Aucune donnée PIB trouvée dans le fichier.")
                 raise ValueError("Données PIB manquantes dans le CSV.")
 
@@ -241,10 +242,10 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
         missing_sectors = [s for s in sectors if s not in df['Secteur'].values]
         missing_macro = [m for m in macro_keywords if m not in df['Secteur'].values]
         if missing_sectors:
-            st.warning(f"Secteurs manquants dans le CSV : {missing_sectors}. Utilisation de la moyenne des secteurs disponibles.")
+            st.warning(f"Attention : Secteurs manquants dans le CSV : {missing_sectors}. Utilisation de la moyenne des secteurs disponibles.")
             error_log.append(f"Secteurs manquants dans le CSV : {missing_sectors}")
         if missing_macro:
-            st.warning(f"Macros manquants : {missing_macro}. Utilisation de valeurs par défaut (0).")
+            st.warning(f"Attention : Macros manquants : {missing_macro}. Utilisation de valeurs par défaut (0).")
             error_log.append(f"Macros manquants : {missing_macro}")
 
         df_macro.set_index("Secteur", inplace=True)
@@ -268,11 +269,12 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
             raise
 
         X_df = pd.concat([df_secteurs_T, df_macro_T], axis=1).dropna()
-        error_log.append(f"Shape de X_df après concaténation : {X_df.shape}")
+        error_log.append(f"Forme de X_df après concaténation : {X_df.shape}")
+        error_log.append(f"Colonnes de X_df après concaténation : {list(X_df.columns)}")
 
         y_df = df_pib_T.loc[X_df.index]
         if y_df.empty:
-            st.error("y_df vide après alignement avec X_df. Indices X_df : {}. Indices df_pib_T : {}".format(X_df.index.tolist(), df_pib_T.index.tolist()))
+            st.error("Erreur : y_df vide après alignement avec X_df. Indices X_df : {}. Indices df_pib_T : {}".format(X_df.index.tolist(), df_pib_T.index.tolist()))
             error_log.append("y_df vide après alignement.")
             raise ValueError("Données PIB vides après prétraitement.")
 
@@ -283,24 +285,35 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
             "information et communication",
             "activites financieres"
         ]
+        key_sectors = [normalize_name(s) for s in key_sectors]
+
         for sector in key_sectors:
+            col_name = f"{sector}_lag1"
             if sector in X_df.columns:
-                X_df[f"{sector}_lag1"] = X_df[sector].shift(1).fillna(X_df[sector].mean())
+                X_df[col_name] = X_df[sector].shift(1).fillna(X_df[sector].mean())
             else:
-                X_df[f"{sector}_lag1"] = X_df[sectors].mean(axis=1).shift(1).fillna(X_df[sectors].mean().mean()) if sectors else 0
-                error_log.append(f"Feature décalée '{sector}_lag1' ajoutée avec moyenne des secteurs car '{sector}' est absent.")
+                X_df[col_name] = X_df[sectors].mean(axis=1).shift(1).fillna(X_df[sectors].mean().mean()) if sectors else 0
+                error_log.append(f"Feature décalée '{col_name}' ajoutée avec moyenne des secteurs car '{sector}' est absent.")
 
         for rate in macro_rates:
+            col_name = f"{rate}_lag1"
             if rate in X_df.columns:
-                X_df[f"{rate}_lag1"] = X_df[rate].shift(1).fillna(X_df[rate].mean())
+                X_df[col_name] = X_df[rate].shift(1).fillna(X_df[rate].mean())
             else:
-                X_df[f"{rate}_lag1"] = 0
-                error_log.append(f"Feature décalée '{rate}_lag1' ajoutée avec valeur 0 car '{rate}' est absent.")
+                X_df[col_name] = 0
+                error_log.append(f"Feature décalée '{col_name}' ajoutée avec valeur 0 car '{rate}' est absent.")
 
         X_df['gdp_lag1'] = y_df.shift(1).fillna(y_df.mean())
 
-        expected_features = sectors + macro_rates + events + [f"{s}_lag1" for s in key_sectors] + [f"{r}_lag1" for r in macro_rates] + ['gdp_lag1']
-        error_log.append(f"Colonnes attendues dans X_df : {expected_features} (nombre: {len(expected_features)})")
+        expected_features = (
+            sectors +
+            macro_rates +
+            events +
+            [f"{s}_lag1" for s in key_sectors] +
+            [f"{r}_lag1" for r in macro_rates] +
+            ['gdp_lag1']
+        )
+        error_log.append(f"Colonnes attendues dans expected_features : {expected_features} (nombre: {len(expected_features)})")
 
         missing_cols = [col for col in expected_features if col not in X_df.columns]
         extra_cols = [col for col in X_df.columns if col not in expected_features]
@@ -317,32 +330,37 @@ def load_and_preprocess(uploaded_file=None, _cache_key="default"):
                     X_df[col] = 0
                     error_log.append(f"Feature manquante '{col}' ajoutée avec valeur 0.")
         if extra_cols:
-            st.warning(f"Colonnes supplémentaires dans X_df : {extra_cols}")
+            st.warning(f"Attention : Colonnes supplémentaires dans X_df : {extra_cols}")
             error_log.append(f"Colonnes supplémentaires dans X_df : {extra_cols}")
             X_df = X_df.drop(columns=extra_cols, errors='ignore')
 
-        error_log.append(f"Colonnes dans X_df après ajout des features manquantes : {list(X_df.columns)}")
+        X_df = X_df[expected_features]
+        error_log.append(f"Colonnes dans X_df après réordonnancement : {list(X_df.columns)}")
         error_log.append(f"Nombre de colonnes dans X_df : {X_df.shape[1]} (attendu : {len(expected_features)})")
+
+        if list(X_df.columns) != expected_features:
+            differences = [(i, a, b) for i, (a, b) in enumerate(zip(X_df.columns, expected_features)) if a != b]
+            error_log.append(f"Non-concordance dans les colonnes de X_df : Différences aux positions {differences}")
+            st.error(f"Erreur : Les colonnes de X_df ({len(X_df.columns)}) ne correspondent pas à expected_features ({len(expected_features)}). Différences : {differences}")
+            st.stop()
 
         scaler_X = StandardScaler()
         scaler_y = StandardScaler()
-        X_df = X_df[expected_features]
-        scaler_X.fit(X_df)
-        error_log.append(f"Scaler_X ajusté sur {scaler_X.n_features_in_} features")
-        X = scaler_X.transform(X_df)
+        X = scaler_X.fit_transform(X_df)
         y = scaler_y.fit_transform(y_df.values.reshape(-1, 1)).flatten()
         quarters = X_df.index
 
         last_year = int(max(quarters).year)
+        logger.info(f"Prétraitement terminé en {time.time() - start_time:.2f} secondes")
         return X, y, quarters, X_df, scaler_X, scaler_y, macro_keywords, sectors, macro_rates, events, last_year, y_df, expected_features, df
 
     except Exception as e:
         error_log.append(f"Erreur lors du chargement du fichier : {str(e)}")
-        st.error(f"Erreur lors du chargement du fichier : {str(e)}")
+        st.error(f"Erreur : Erreur lors du chargement du fichier : {str(e)}")
         raise
 
-# File uploader
-uploaded_file = st.file_uploader("Upload your updated dataset (CSV, optional)", type=["csv"])
+# Téléversement du fichier
+uploaded_file = st.file_uploader("Téléchargez votre jeu de données mis à jour (CSV, optionnel)", type=["csv"])
 if uploaded_file:
     st.cache_data.clear()
     st.cache_resource.clear()
@@ -392,32 +410,31 @@ if uploaded_file:
                 df_updated = pd.concat([df_preview, edited_row], ignore_index=True)
                 output_file = "updated_PIB_Trimestrielle.csv"
                 df_updated.to_csv(output_file, sep=';', index=False, encoding='latin-1')
-                st.success(f"Nouvelle ligne enregistrée dans '{output_file}'.")
-                # Create a BytesIO object to simulate an uploaded file
+                st.success(f"Succès : Nouvelle ligne enregistrée dans '{output_file}'.")
                 csv_buffer = BytesIO()
                 df_updated.to_csv(csv_buffer, sep=';', index=False, encoding='latin-1')
                 csv_buffer.seek(0)
                 uploaded_file = csv_buffer
-                uploaded_file.name = output_file  # Streamlit expects a 'name' attribute
+                uploaded_file.name = output_file
     except Exception as e:
         error_log.append(f"Erreur lors de la lecture du fichier uploadé pour l'aperçu : {str(e)}")
-        st.error(f"Erreur lors de la lecture du fichier uploadé : {str(e)}")
+        st.error(f"Erreur : Erreur lors de la lecture du fichier uploadé : {str(e)}")
         st.stop()
 
-# Load data
+# Chargement des données
 try:
     cache_key = "default" if uploaded_file is None else hashlib.sha256(uploaded_file.read()).hexdigest()
     if uploaded_file:
         uploaded_file.seek(0)
     X, y, quarters, X_df, scaler_X, scaler_y, macro_keywords, sectors, macro_rates, events, last_year, y_df, expected_features, df = load_and_preprocess(uploaded_file, cache_key)
 except (ValueError, FileNotFoundError, KeyError) as e:
-    st.error(str(e))
+    st.error(f"Erreur : {str(e)}")
     st.stop()
 
 st.write(f"**Dernière année disponible dans les données :** {last_year}")
 st.write(f"**Nombre de features dans X_df :** {X_df.shape[1]} (attendu : {len(expected_features)})")
 
-# Cache model structure
+# Structure du modèle en cache
 @st.cache_resource(show_spinner=False)
 def get_model_structure(model_type, _cache_key="default"):
     if model_type == "Ridge":
@@ -436,30 +453,53 @@ def get_model_structure(model_type, _cache_key="default"):
             ('huber', HuberRegressor(max_iter=1000))
         ])
 
-# Define models
+# Définition des modèles
 tscv = TimeSeriesSplit(n_splits=8)
-
 ridge_params = {
     'ridge__alpha': np.logspace(-2, 3, 50),
     'feature_selection__k': [5, 10, 15, 20, 25]
 }
-ridge_cv = RandomizedSearchCV(get_model_structure("Ridge"), ridge_params, cv=tscv, scoring='neg_mean_absolute_error', n_iter=20, random_state=42)
+ridge_cv = RandomizedSearchCV(
+    get_model_structure("Ridge"),
+    ridge_params,
+    cv=tscv,
+    scoring='neg_mean_absolute_error',
+    n_iter=20,
+    random_state=42,
+    n_jobs=-1
+)
 
 elasticnet_params = {
     'elasticnet__alpha': np.logspace(-2, 3, 50),
     'elasticnet__l1_ratio': np.linspace(0.1, 0.9, 9),
     'feature_selection__k': [5, 10, 15, 20, 25]
 }
-elasticnet_cv = RandomizedSearchCV(get_model_structure("ElasticNet"), elasticnet_params, cv=tscv, scoring='neg_mean_absolute_error', n_iter=20, random_state=42)
+elasticnet_cv = RandomizedSearchCV(
+    get_model_structure("ElasticNet"),
+    elasticnet_params,
+    cv=tscv,
+    scoring='neg_mean_absolute_error',
+    n_iter=20,
+    random_state=42,
+    n_jobs=-1
+)
 
 huber_params = {
     'huber__epsilon': np.linspace(1.1, 2.0, 10),
     'huber__alpha': np.logspace(-4, 1, 20),
     'feature_selection__k': [5, 10, 15, 20, 25]
 }
-huber_cv = RandomizedSearchCV(get_model_structure("Huber"), huber_params, cv=tscv, scoring='neg_mean_absolute_error', n_iter=20, random_state=42)
+huber_cv = RandomizedSearchCV(
+    get_model_structure("Huber"),
+    huber_params,
+    cv=tscv,
+    scoring='neg_mean_absolute_error',
+    n_iter=20,
+    random_state=42,
+    n_jobs=-1
+)
 
-# Load or train models
+# Chargement ou entraînement des modèles
 def load_or_train_models(X, y, cache_key):
     default_file = "PIB_Trimestrielle.csv"
     model_dir = "saved_models"
@@ -497,8 +537,8 @@ def load_or_train_models(X, y, cache_key):
                         test_r2 = r2_score(y_unscaled[-len(preds_test):], test_pred_unscaled)
 
                         st.markdown(f"### 🔍 Résultats pour **{name}** (chargé depuis le disque)")
-                        st.write(f"Train MAE: {train_mae:.2f}, Test MAE (TimeSeriesSplit): {test_mae:.2f}")
-                        st.write(f"Train R²: {train_r2:.4f}, Test R²: {test_r2:.4f}")
+                        st.write(f"MAE d'entraînement : {train_mae:.2f}, MAE de test (TimeSeriesSplit) : {test_mae:.2f}")
+                        st.write(f"R² d'entraînement : {train_r2:.4f}, R² de test : {test_r2:.4f}")
                         st.write(f"Meilleurs hyperparamètres : {model_cv.best_params_}")
 
                         interpret_results(name, train_mae, test_mae, train_r2, test_r2)
@@ -512,7 +552,7 @@ def load_or_train_models(X, y, cache_key):
                         error_log.append(f"Modèle {name} chargé depuis {file_path}")
                     except Exception as e:
                         error_log.append(f"Échec du chargement du modèle {name} depuis {file_path}: {str(e)}")
-                        st.warning(f"Échec du chargement du modèle {name}. Retraining...")
+                        st.warning(f"Attention : Échec du chargement du modèle {name}. Réentraînement...")
                         mae, r2, trained_model = eval_and_detect(globals()[f"{name.lower()}_cv"], X, y, name)
                         joblib.dump(trained_model, file_path)
                         results.append({
@@ -523,7 +563,7 @@ def load_or_train_models(X, y, cache_key):
                         models[name] = trained_model
                         test_maes[name] = mae
                 else:
-                    with st.spinner(f"Training {name}..."):
+                    with st.spinner(f"Entraînement de {name}..."):
                         mae, r2, trained_model = eval_and_detect(globals()[f"{name.lower()}_cv"], X, y, name)
                         joblib.dump(trained_model, file_path)
                         results.append({
@@ -535,7 +575,7 @@ def load_or_train_models(X, y, cache_key):
                         test_maes[name] = mae
         else:
             for name, file_path in model_files.items():
-                with st.spinner(f"Training {name}..."):
+                with st.spinner(f"Entraînement de {name}..."):
                     mae, r2, trained_model = eval_and_detect(globals()[f"{name.lower()}_cv"], X, y, name)
                     joblib.dump(trained_model, file_path)
                     results.append({
@@ -546,9 +586,10 @@ def load_or_train_models(X, y, cache_key):
                     models[name] = trained_model
                     test_maes[name] = mae
     else:
-        for name in ["Ridge", "ElasticNet", "Huber"]:
-            with st.spinner(f"Training {name}..."):
+        for name, file_path in model_files.items():
+            with st.spinner(f"Entraînement de {name}..."):
                 mae, r2, trained_model = eval_and_detect(globals()[f"{name.lower()}_cv"], X, y, name)
+                joblib.dump(trained_model, file_path)
                 results.append({
                     'Modèle': name,
                     'CV MAE': mae,
@@ -559,7 +600,7 @@ def load_or_train_models(X, y, cache_key):
 
     return results, models, test_maes
 
-# Evaluation and interpretation function
+# Fonction d'évaluation et d'interprétation
 def interpret_results(model_name, train_mae, test_mae, train_r2, test_r2):
     rel_error = test_mae / np.mean(scaler_y.inverse_transform(y.reshape(-1, 1)))
     st.markdown("#### 💡 Interprétation")
@@ -567,7 +608,7 @@ def interpret_results(model_name, train_mae, test_mae, train_r2, test_r2):
     st.write(f"**MAE absolue :** {test_mae:.0f} — pour un PIB moyen ~{np.mean(scaler_y.inverse_transform(y.reshape(-1, 1))):,.0f}, soit une erreur relative d’environ **{rel_error*100:.1f}%**.")
     diff_r2 = train_r2 - test_r2
     if diff_r2 > 0.15:
-        st.error("⚠️ Écart important entre R² train et test → possible surapprentissage.")
+        st.error("⚠️ Écart important entre R² d'entraînement et de test → possible surapprentissage.")
     else:
         st.success("✅ Pas de signe évident de surapprentissage.")
 
@@ -579,7 +620,7 @@ def interpret_results(model_name, train_mae, test_mae, train_r2, test_r2):
     elif test_r2 >= 0.90:
         st.write(f"✔️ **{model_name} est un bon modèle,** mais peut être amélioré.")
     else:
-        st.write(f"❌ **{model_name} montre des limites.** Envisage une autre méthode ou un tuning plus poussé.")
+        st.write(f"❌ **{model_name} montre des limites.** Envisagez une autre méthode ou un réglage plus poussé.")
 
 def eval_and_detect(model_cv, X, y, model_name):
     model_cv.fit(X, y)
@@ -600,22 +641,22 @@ def eval_and_detect(model_cv, X, y, model_name):
     test_r2 = r2_score(y_unscaled[-len(preds_test):], test_pred_unscaled)
 
     st.markdown(f"### 🔍 Résultats pour **{model_name}**")
-    st.write(f"Train MAE: {train_mae:.2f}, Test MAE (TimeSeriesSplit): {test_mae:.2f}")
-    st.write(f"Train R²: {train_r2:.4f}, Test R²: {test_r2:.4f}")
+    st.write(f"MAE d'entraînement : {train_mae:.2f}, MAE de test (TimeSeriesSplit) : {test_mae:.2f}")
+    st.write(f"R² d'entraînement : {train_r2:.4f}, R² de test : {test_r2:.4f}")
     st.write(f"Meilleurs hyperparamètres : {model_cv.best_params_}")
 
     interpret_results(model_name, train_mae, test_mae, train_r2, test_r2)
     return test_mae, test_r2, model_cv
 
-# Run models
+# Exécution des modèles
 st.header("📊 Diagnostic et interprétation des modèles")
 results, models, test_maes = load_or_train_models(X, y, cache_key)
 
 if not test_maes:
-    st.error("Aucun modèle n'a été entraîné ou chargé. Veuillez vérifier les données d'entrée.")
+    st.error("Erreur : Aucun modèle n'a été entraîné ou chargé. Veuillez vérifier les données d'entrée.")
     st.stop()
 
-# Select best model
+# Sélection du meilleur modèle
 best_model_name = min(test_maes, key=test_maes.get)
 best_model = models[best_model_name].best_estimator_
 st.markdown(f"### 🏆 Modèle sélectionné : **{best_model_name}**")
@@ -626,17 +667,17 @@ st.header("🔎 Vérification du modèle sélectionné")
 st.markdown("#### 1. Vérification de l'intégrité des données")
 if X_df.isna().any().any():
     error_log.append("Valeurs manquantes détectées dans X_df.")
-    st.error("Valeurs manquantes dans les données d'entrée. Remplacement par 0.")
+    st.error("Erreur : Valeurs manquantes dans les données d'entrée. Remplacement par 0.")
     X_df = X_df.fillna(0)
 if y_df.isna().any().any():
     error_log.append("Valeurs manquantes détectées dans y_df.")
-    st.warning("Valeurs manquantes dans les données cibles. Remplacement par la moyenne.")
+    st.warning("Attention : Valeurs manquantes dans les données cibles. Remplacement par la moyenne.")
     y_df = y_df.fillna(y_df.mean())
 if y_df.empty or y_df.shape[0] == 0:
     error_log.append("y_df est vide ou n'a aucune ligne.")
-    st.error("Les données cibles (y_df) sont vides. Arrêt du programme.")
+    st.error("Erreur : Les données cibles (y_df) sont vides. Arrêt du programme.")
     st.stop()
-st.success("Aucune valeur manquante dans les données après prétraitement. y_df shape: {}".format(y_df.shape))
+st.success("Succès : Aucune valeur manquante dans les données après prétraitement. Forme de y_df : {}".format(y_df.shape))
 
 st.markdown("#### 2. Vérification sur un ensemble de test")
 train_size = int(0.8 * len(X))
@@ -652,20 +693,26 @@ st.write(f"MAE sur l'ensemble de test : {test_mae:.2f}")
 st.write(f"R² sur l'ensemble de test : {test_r2:.4f}")
 if test_mae > 1.5 * test_maes[best_model_name]:
     error_log.append(f"MAE sur l'ensemble de test ({test_mae:.2f}) significativement plus élevé que le MAE CV ({test_maes[best_model_name]:.2f}).")
-    st.warning("Performance sur l'ensemble de test moins bonne que prévue.")
+    st.warning("Attention : Performance sur l'ensemble de test moins bonne que prévue.")
 
 st.markdown("#### 3. Analyse des résidus")
 residuals = y_test_unscaled - y_pred_test_unscaled
-fig_residuals = px.scatter(x=range(len(residuals)), y=residuals, title="Résidus sur l'ensemble de test",
-                           labels={'x': 'Index', 'y': 'Résidus (million TND)'}, color_discrete_sequence=['#FF6B6B'])
+fig_residuals = px.scatter(
+    x=range(len(residuals)),
+    y=residuals,
+    title="Résidus sur l'ensemble de test",
+    labels={'x': 'Index', 'y': 'Résidus (million TND)'},
+    color_discrete_sequence=['#FF6B6B'],
+    render_mode='webgl'
+)
 fig_residuals.add_hline(y=0, line_dash="dash", line_color="black")
-st.plotly_chart(fig_residuals)
+st.plotly_chart(fig_residuals, use_container_width=True)
 if np.abs(residuals).mean() > test_maes[best_model_name]:
     error_log.append(f"Les résidus moyens ({np.abs(residuals).mean():.2f}) sont élevés par rapport au MAE CV ({test_maes[best_model_name]:.2f}).")
-    st.warning("Les résidus montrent une erreur moyenne élevée, indiquant une possible sous-performance.")
+    st.warning("Attention : Les résidus montrent une erreur moyenne élevée, indiquant une possible sous-performance.")
 
 st.markdown("#### 4. Intervalles de prédiction")
-n_bootstraps = 100
+n_bootstraps = 50
 bootstrap_preds = []
 for _ in range(n_bootstraps):
     indices = np.random.choice(len(X_train), len(X_train), replace=True)
@@ -679,9 +726,10 @@ st.write("Intervalles de prédiction à 95% pour l'ensemble de test :")
 for i, (lower, upper, actual) in enumerate(zip(lower_bound, upper_bound, y_test_unscaled)):
     st.write(f"Trimestre {i+1}: Prédit = {y_pred_test_unscaled[i]:,.0f}, Intervalle = [{lower:,.0f}, {upper:,.0f}], Réel = {actual:,.0f}")
 
-# Prediction for 2024
+# Prédiction pour 2024
 if st.button("🔮 Prédire le PIB pour 2024"):
-    with st.spinner("Training and predicting..."):
+    with st.spinner("Entraînement et prédiction..."):
+        start_time = time.time()
         quarters_to_predict = ["Q1", "Q2", "Q3", "Q4"]
         base_quarter = max(X_df.index)
         historical_df = pd.DataFrame({'Trimestre': [str(q) for q in quarters], 'PIB': scaler_y.inverse_transform(y.reshape(-1, 1)).flatten()})
@@ -710,61 +758,50 @@ if st.button("🔮 Prédire le PIB pour 2024"):
                 error_log.append(f"Valeur pour '{event}' non trouvée. Utilisation de 0.")
 
         for i, q in enumerate(quarters_to_predict):
-            feature_vector = pd.DataFrame(index=[0], columns=expected_features).fillna(0.0)
+            feature_vector = pd.DataFrame(0.0, index=[0], columns=expected_features)
+            logger.info(f"Création du vecteur de features pour {q} avec {len(feature_vector.columns)} colonnes : {list(feature_vector.columns)}")
+
             for sector in sectors:
-                try:
-                    if sector not in X_df.columns:
-                        error_log.append(f"Erreur pour {sector} ({q}): non trouvé dans X_df. Utilisation de 0.")
-                        feature_vector[sector] = 0.0
-                    else:
-                        feature_vector[sector] = current_base_data[sector] * (1 + growth_rates[sector] / 100)
-                except Exception as e:
-                    error_log.append(f"Erreur pour {sector} ({q}): {str(e)}. Utilisation de 0.")
-                    feature_vector[sector] = 0.0
+                feature_vector[sector] = (
+                    current_base_data[sector] * (1 + growth_rates.get(sector, 0.0) / 100)
+                    if sector in X_df.columns else 0.0
+                )
+                if sector not in X_df.columns:
+                    error_log.append(f"Secteur '{sector}' non trouvé pour {q}. Utilisation de 0.")
 
             for rate in macro_rates:
-                try:
-                    if rate not in X_df.columns:
-                        error_log.append(f"Erreur pour {rate} ({q}): non trouvé dans X_df. Utilisation de 0.")
-                        feature_vector[rate] = 0.0
-                    else:
-                        feature_vector[rate] = current_base_data[rate] * (1 + growth_rates[rate] / 100)
-                except Exception as e:
-                    error_log.append(f"Erreur pour {rate} ({q}): {str(e)}. Utilisation de 0.")
-                    feature_vector[rate] = 0.0
+                feature_vector[rate] = (
+                    current_base_data[rate] * (1 + growth_rates.get(rate, 0.0) / 100)
+                    if rate in X_df.columns else 0.0
+                )
+                if rate not in X_df.columns:
+                    error_log.append(f"Rate '{rate}' non trouvé pour {q}. Utilisation de 0.")
 
             for event in events:
-                try:
-                    if event in X_df.columns:
-                        feature_vector[event] = growth_rates[event]
-                    else:
-                        error_log.append(f"Erreur pour {event} ({q}): non trouvé dans X_df. Utilisation de 0.")
-                        feature_vector[event] = 0
-                except Exception as e:
-                    error_log.append(f"Erreur pour {event} ({q}): {str(e)}. Utilisation de 0.")
-                    feature_vector[event] = 0
+                feature_vector[event] = growth_rates.get(event, 0.0)
+                if event not in X_df.columns:
+                    error_log.append(f"Événement '{event}' non trouvé pour {q}. Utilisation de 0.")
 
             for col in expected_features:
-                if col not in sectors + macro_rates + events:
-                    if col.endswith('_lag1'):
-                        base_col = col.replace('_lag1', '')
-                        if base_col in feature_vector.columns:
-                            feature_vector[col] = current_base_data.get(base_col, X_df[base_col].mean() if base_col in X_df.columns else 0.0)
-                        else:
-                            feature_vector[col] = current_base_data.get(col, X_df[col].mean() if col in X_df.columns else 0.0)
-                        if feature_vector[col].iloc[0] == 0.0:
-                            error_log.append(f"Feature décalée '{col}' pour {q} définie à 0 (données manquantes).")
-                    else:
-                        feature_vector[col] = current_base_data.get(col, X_df[col].mean() if col in X_df.columns else 0.0)
-                        if feature_vector[col].iloc[0] == 0.0:
-                            error_log.append(f"Feature '{col}' pour {q} définie à 0 (données manquantes).")
+                if col.endswith('_lag1'):
+                    base_col = col.replace('_lag1', '')
+                    feature_vector[col] = (
+                        current_base_data.get(base_col, X_df[base_col].mean() if base_col in X_df.columns else 0.0)
+                        if base_col in feature_vector.columns else
+                        current_base_data.get(col, X_df[col].mean() if col in X_df.columns else 0.0)
+                    )
+                    if feature_vector[col].iloc[0] == 0.0:
+                        error_log.append(f"Feature décalée '{col}' pour {q} définie à 0.")
+
+            if list(feature_vector.columns) != expected_features:
+                error_log.append(f"Non-concordance dans les colonnes de feature_vector pour {q}: Attendu {len(expected_features)} colonnes, Obtenu {len(feature_vector.columns)} colonnes: {list(feature_vector.columns)}")
+                st.error(f"Erreur : Les colonnes de feature_vector ({len(feature_vector.columns)}) ne correspondent pas à expected_features ({len(expected_features)}).")
+                st.stop()
 
             if feature_vector.isna().any().any():
                 error_log.append(f"Valeurs NaN pour {q} : {feature_vector.columns[feature_vector.isna().any()].tolist()}. Remplacement par 0.")
                 feature_vector = feature_vector.fillna(0.0)
 
-            feature_vector = feature_vector[expected_features]
-            error_log.append(f"Feature vector pour {q} : {list(feature_vector.columns)} (nombre: {len(feature_vector.columns)})")
             X_new = scaler_X.transform(feature_vector)
             feature_vectors.append(X_new)
 
@@ -782,7 +819,6 @@ if st.button("🔮 Prédire le PIB pour 2024"):
             st.write(f"- **{q} 2024** : {quarterly_predictions[i]:,.0f} million TND")
         st.write(f"**PIB annuel estimé pour 2024** : {yearly_gdp:,.0f} million TND")
 
-        # Plot historical vs predicted GDP
         y_pred_historical = best_model.predict(X)
         y_pred_historical_unscaled = scaler_y.inverse_transform(y_pred_historical.reshape(-1, 1)).flatten()
         y_historical_unscaled = scaler_y.inverse_transform(y.reshape(-1, 1)).flatten()
@@ -798,19 +834,37 @@ if st.button("🔮 Prédire le PIB pour 2024"):
         })
         combined_df = pd.concat([historical_df, pred_df], ignore_index=True)
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=combined_df['Trimestre'], y=combined_df['PIB Réel'], mode='lines+markers', name='PIB Réel', line=dict(color='blue')))
-        fig.add_trace(go.Scatter(x=combined_df['Trimestre'], y=combined_df['PIB Prédit'], mode='lines+markers', name='PIB Prédit', line=dict(color='red', dash='dash')))
-        fig.update_layout(title='PIB Historique vs Prédictions (incl. 2024)', xaxis_title='Trimestre', yaxis_title='PIB (million TND)')
-        st.plotly_chart(fig)
+        fig.add_trace(go.Scatter(
+            x=combined_df['Trimestre'],
+            y=combined_df['PIB Réel'],
+            mode='lines+markers',
+            name='PIB Réel',
+            line=dict(color='blue')
+        ))
+        fig.add_trace(go.Scatter(
+            x=combined_df['Trimestre'],
+            y=combined_df['PIB Prédit'],
+            mode='lines+markers',
+            name='PIB Prédit',
+            line=dict(color='red', dash='dash')
+        ))
+        fig.update_layout(
+            title='PIB Historique vs Prédictions (incl. 2024)',
+            xaxis_title='Trimestre',
+            yaxis_title='PIB (million TND)',
+            xaxis_tickangle=45,
+            height=500,
+            template='plotly_white'
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        # SHAP explanations
         st.markdown("### 🧠 Explication des prédictions avec SHAP")
         st.write("Les graphiques suivants expliquent comment chaque feature contribue aux prédictions du PIB pour 2024.")
         best_model.fit(X, y)
         feature_vectors_for_shap = np.vstack(feature_vectors)
-        error_log.append(f"Shape de feature_vectors_for_shap : {feature_vectors_for_shap.shape}")
-        background_data = scaler_X.transform(X_df[expected_features].iloc[:50])  # Use first 50 samples for SHAP
-        error_log.append(f"Shape de background_data : {background_data.shape}")
+        error_log.append(f"Forme de feature_vectors_for_shap : {feature_vectors_for_shap.shape}")
+        background_data = scaler_X.transform(X_df[expected_features].iloc[:20])
+        error_log.append(f"Forme de background_data : {background_data.shape}")
 
         try:
             if best_model_name in ["Ridge", "ElasticNet"]:
@@ -819,15 +873,16 @@ if st.button("🔮 Prédire le PIB pour 2024"):
                     background_data,
                     feature_names=expected_features
                 )
-            else:  # Huber
+            else:
                 explainer = shap.KernelExplainer(
                     best_model.predict,
                     background_data,
-                    feature_names=expected_features
+                    feature_names=expected_features,
+                    nsamples=100
                 )
 
             shap_values = explainer.shap_values(feature_vectors_for_shap)
-            error_log.append(f"Shape de shap_values : {np.array(shap_values).shape}")
+            error_log.append(f"Forme de shap_values : {np.array(shap_values).shape}")
 
             st.markdown("#### 📊 Importance globale des features (Summary Plot)")
             plt.figure(figsize=(10, 6), dpi=80)
@@ -843,25 +898,12 @@ if st.button("🔮 Prédire le PIB pour 2024"):
                 st.pyplot(plt)
                 plt.close()
 
-            st.markdown("#### 📈 Contribution des features par trimestre (Force Plots)")
-            for i, q in enumerate(quarters_to_predict):
-                st.write(f"**{q} 2024**")
-                plt.figure(figsize=(10, 4), dpi=80)
-                shap.force_plot(
-                    explainer.expected_value,
-                    shap_values[i],
-                    feature_vectors_for_shap[i],
-                    feature_names=expected_features,
-                    matplotlib=True,
-                    show=False
-                )
-                st.pyplot(plt)
-                plt.close()
         except Exception as e:
             error_log.append(f"Erreur lors du calcul SHAP : {str(e)}")
-            st.error(f"Impossible de générer les explications SHAP : {str(e)}. Veuillez vérifier les données.")
+            st.error(f"Erreur : Impossible de générer les explications SHAP : {str(e)}. Veuillez vérifier les données.")
 
         st.info(f"🧪 Prédiction basée sur le modèle {best_model_name} avec le MAE le plus bas, utilisant les tendances historiques extrapolées à partir des 4 derniers trimestres.")
+        logger.info(f"Prédiction terminée en {time.time() - start_time:.2f} secondes")
 
         show_errors = st.checkbox("Afficher le journal", value=True)
         if show_errors and error_log:
